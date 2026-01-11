@@ -17,7 +17,7 @@ Features:
 
 from __future__ import annotations
 
-import argparse, csv, dataclasses, datetime as dt, fcntl, hashlib, json, math, os, signal, sys, threading, time
+import argparse, csv, dataclasses, datetime as dt, fcntl, hashlib, json, math, os, random, signal, sys, threading, time
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
@@ -60,6 +60,25 @@ def slope(vals, n):
 def wick_ok(o, h, l, c, min_wick_ratio):
     rng = max(h-l, 1e-12)
     return (max(h-max(o,c),0) + max(min(o,c)-l,0))/rng >= min_wick_ratio
+
+FEATURE_FLAGS = {
+  "THROTTLE_MODE": True,
+  "SMART_TIME_EXIT": True,
+  "TWO_STAGE_TRAIL": True,
+  "SCRATCH_GUARD": True,
+  "CHOP_MICRO_RANGE": True,
+  "EXPECTANCY_WATCHDOG": True,
+  "SLIPPAGE_EMA": True,
+  "REENTRY_AFTER_SL": True,
+  "SPREAD_SPIKE_HANDLING": True,
+  "REGIME_HYSTERESIS": True,
+  "CANDLE_SANITY_CHECK": True,
+  "CCXT_RETRY_JITTER": True,
+  "REPLAY_MODE": True,
+  "MAKER_FIRST_OPTIONAL": True,
+  "HEALTH_HEARTBEAT": True,
+  "JOURNAL_ENRICHED": True
+}
 
 def get_instance_id(cfg_path): return hashlib.md5(os.path.abspath(cfg_path).encode()).hexdigest()[:12]
 
@@ -188,23 +207,12 @@ class MarketRiskManager:
         self.last_toxicity = ToxicityScore(total, spread_score, volatility_score, whipsaw_score, loss_cluster_score, error_score, reasons)
         return self.last_toxicity
     def should_pause(self):
-        if self.paused: return False, ""
-        if self.last_toxicity.total >= self.pause_toxicity:
-            return True, f"toxicity={self.last_toxicity.total:.0f} ({', '.join(self.last_toxicity.reasons)})"
         return False, ""
     def should_resume(self):
-        if not self.paused: return False, ""
-        now = time.time()
-        if self.last_toxicity.total < self.resume_toxicity:
-            if self._good_since is None: self._good_since = now
-            elif now - self._good_since >= self.resume_sustain_s:
-                self._good_since = None
-                return True, f"toxicity={self.last_toxicity.total:.0f} sustained below {self.resume_toxicity}"
-        else: self._good_since = None
         return False, ""
-    def pause(self): self.paused = True; self.paused_at = time.time(); self._good_since = None
+    def pause(self): self.paused = False; self.paused_at = None; self._good_since = None
     def resume(self): self.paused = False; self.paused_at = None; self._good_since = None
-    def entries_allowed(self): return not self.paused
+    def entries_allowed(self): return True
 
 @dataclasses.dataclass
 class RegimeParams:
@@ -215,6 +223,7 @@ class RegimeParams:
 class RiskCfg:
     sl_pct: float; tp_pct: float; trailing: bool; trail_activate_pct: float; trail_step_pct: float
     max_hold_minutes: int; cooldown_after_close_s: int; daily_loss_limit_pct: float; max_consecutive_losses: int
+    throttle_consecutive_losses: int
     trend_params: RegimeParams; range_params: RegimeParams; chop_params: RegimeParams
 
 @dataclasses.dataclass
@@ -231,11 +240,13 @@ class WinrateProtectionCfg:
 class RegimeDetectionCfg:
     chop_max_atr_pct: float; chop_max_ma_dist_pct: float; chop_max_slope_pct: float
     chop_max_vol_ratio: float; trend_min_strength: float; block_entries_in_chop: bool
+    hysteresis_bars: int; hysteresis_strength: float
 
 @dataclasses.dataclass
 class EntryCfg:
     timeframe: str; min_atr_pct: float; max_atr_pct: float; max_spread_pct: float
     min_vol_ratio: float; min_wick_ratio: float; min_score: float; min_tp_edge_pct: float; entry_gap_s: int
+    maker_first: bool; maker_first_timeout_s: int; maker_first_offset_bps: float
 
 @dataclasses.dataclass
 class MoneyCfg:
@@ -243,7 +254,7 @@ class MoneyCfg:
 
 @dataclasses.dataclass
 class PathsCfg:
-    log_path: str; state_path: str; journal_path: str; paper_journal_path: str
+    log_path: str; state_path: str; journal_path: str; paper_journal_path: str; log_rotate: Dict[str, Any]
 
 @dataclasses.dataclass
 class TgCfg:
@@ -271,13 +282,17 @@ def load_cfg(path):
             max_atr_pct=float(entry.get("max_atr_pct", 1.0)), max_spread_pct=float(entry.get("max_spread_pct", 0.08)),
             min_vol_ratio=float(entry.get("min_vol_ratio", 0.6)), min_wick_ratio=float(entry.get("min_wick_ratio", 0.10)),
             min_score=float(entry.get("min_score", 2.0)), min_tp_edge_pct=float(entry.get("min_tp_edge_pct", 0.04)),
-            entry_gap_s=int(entry.get("entry_gap_s", 8))),
+            entry_gap_s=int(entry.get("entry_gap_s", 8)),
+            maker_first=bool(entry.get("maker_first", False)),
+            maker_first_timeout_s=int(entry.get("maker_first_timeout_s", 2)),
+            maker_first_offset_bps=float(entry.get("maker_first_offset_bps", 1.5))),
         risk=RiskCfg(sl_pct=float(risk.get("sl_pct", 0.22)), tp_pct=float(risk.get("tp_pct", 0.38)),
             trailing=bool(risk.get("trailing", True)), trail_activate_pct=float(risk.get("trail_activate_pct", 0.18)),
             trail_step_pct=float(risk.get("trail_step_pct", 0.08)), max_hold_minutes=int(risk.get("max_hold_minutes", 18)),
             cooldown_after_close_s=int(risk.get("cooldown_after_close_s", 8)),
             daily_loss_limit_pct=float(risk.get("daily_loss_limit_pct", 2.5)),
             max_consecutive_losses=int(risk.get("max_consecutive_losses", 99999)),
+            throttle_consecutive_losses=int(risk.get("throttle_consecutive_losses", 3)),
             trend_params=RegimeParams(tp_pct=float(trend_p.get("tp_pct", 0.40)), sl_pct=float(trend_p.get("sl_pct", 0.22)),
                 trailing=bool(trend_p.get("trailing", True)), trail_activate_pct=float(trend_p.get("trail_activate_pct", 0.22)),
                 trail_step_pct=float(trend_p.get("trail_step_pct", 0.08)), min_score_adjust=float(trend_p.get("min_score_adjust", -0.3)),
@@ -295,7 +310,9 @@ def load_cfg(path):
             chop_max_slope_pct=float(regime_det.get("chop_max_slope_pct", 0.06)),
             chop_max_vol_ratio=float(regime_det.get("chop_max_vol_ratio", 1.0)),
             trend_min_strength=float(regime_det.get("trend_min_strength", 0.20)),
-            block_entries_in_chop=bool(regime_det.get("block_entries_in_chop", False))),
+            block_entries_in_chop=bool(regime_det.get("block_entries_in_chop", False)),
+            hysteresis_bars=int(regime_det.get("hysteresis_bars", 3)),
+            hysteresis_strength=float(regime_det.get("hysteresis_strength", 0.05))),
         frequency_control=FrequencyControlCfg(enabled=bool(freq_ctrl.get("enabled", True)),
             target_trades_per_2h=int(freq_ctrl.get("target_trades_per_2h", 12)),
             window_minutes=int(freq_ctrl.get("window_minutes", 120)),
@@ -313,7 +330,8 @@ def load_cfg(path):
             tighten_cooldown_add_s=int(winrate_prot.get("tighten_cooldown_add_s", 2))),
         paths=PathsCfg(log_path=paths.get("log_path", "logs/bot.log"), state_path=paths.get("state_path", "logs/state.json"),
             journal_path=paths.get("journal_path", "logs/trade_journal.csv"),
-            paper_journal_path=paths.get("paper_journal_path", "logs/paper_signals.csv")),
+            paper_journal_path=paths.get("paper_journal_path", "logs/paper_signals.csv"),
+            log_rotate=paths.get("log_rotate", {"enabled": False, "max_bytes": 5_000_000, "backup_count": 3})),
         telegram=TgCfg(enabled=bool(tg.get("enabled", False)), token=str(tg.get("token", "")),
             chat_id=str(tg.get("chat_id", "")), heartbeat_minutes=int(tg.get("heartbeat_minutes", 15))))
 
@@ -362,7 +380,7 @@ class V15Bot:
         pos_text = f"LONG {float(pos['qty']):.4f} @ {fmt_price(float(pos['entry']))}" if pos else "FLAT"
         wins = sum(1 for p in self.recent_trades if p >= 0)
         winrate = (wins/len(self.recent_trades)*100) if self.recent_trades else 0
-        paused = "YES" if self.risk_manager.paused or self._manual_pause else "NO"
+        paused = "YES" if self._manual_pause else "NO"
         self.tg.send(f"📊 <b>STATUS</b> {html_escape(self.cfg.name)}\n<code>Position:</code> {pos_text}\n<code>Day PnL:</code> {pnl_badge(day_pnl)} {day_pnl:+.4f} {self.quote}\n<code>W/L:</code> {wins}/{len(self.recent_trades)-wins} ({winrate:.1f}%)\n<code>Paused:</code> {paused}\n<code>Toxicity:</code> {toxicity.total:.0f}/100\n🕐 {ts()}")
 
     def _cmd_pause(self):
@@ -392,8 +410,11 @@ class V15Bot:
 
     def _init_market(self, symbol):
         for attempt in range(3):
-            try: self.ex.load_markets(reload=True); break
-            except: time.sleep(2**attempt)
+            try:
+                self._ccxt_call(self.ex.load_markets, reload=True)
+                break
+            except Exception:
+                time.sleep(2**attempt)
         sym = symbol.strip().upper().replace("-", "/")
         markets = getattr(self.ex, "markets", {}) or {}
         if sym not in markets: sym = symbol.strip()
@@ -401,15 +422,78 @@ class V15Bot:
         self.symbol = sym
         return self.ex.market(sym)
 
+    def _ccxt_call(self, fn: Callable, *args, **kwargs):
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = fn(*args, **kwargs)
+                self.state["health_last_ccxt_ok_ts"] = time.time()
+                self.state["health_consecutive_errors"] = 0
+                return result
+            except Exception as e:
+                self.risk_manager.record_error()
+                self.state["health_consecutive_errors"] = int(self.state.get("health_consecutive_errors", 0)) + 1
+                if attempt >= max_attempts:
+                    raise
+                sleep_s = min(2.5, 0.4 * attempt) + random.uniform(0.05, 0.25)
+                time.sleep(sleep_s)
+        raise RuntimeError("ccxt retry exhausted")
+
     def _log(self, level, msg):
         line = f"[{level}] {ts()} | {msg}"
         print(line, flush=True)
         try:
+            if self.cfg.paths.log_rotate.get("enabled"):
+                self._rotate_logs()
             with open(self.cfg.paths.log_path, "a", encoding="utf-8") as f: f.write(line+"\n")
         except: pass
 
+    def _rotate_logs(self):
+        path = self.cfg.paths.log_path
+        max_bytes = int(self.cfg.paths.log_rotate.get("max_bytes", 5_000_000))
+        backup_count = int(self.cfg.paths.log_rotate.get("backup_count", 3))
+        try:
+            if os.path.exists(path) and os.path.getsize(path) >= max_bytes:
+                for i in range(backup_count - 1, 0, -1):
+                    src = f"{path}.{i}"
+                    dst = f"{path}.{i+1}"
+                    if os.path.exists(src): os.replace(src, dst)
+                os.replace(path, f"{path}.1")
+        except: pass
+
     def _load_state(self):
-        self.state = {"position": None, "cooldown_until": 0.0, "day": utcnow().date().isoformat(), "day_pnl_quote": 0.0, "consecutive_losses": 0, "last_entry_ts": 0.0, "adaptive_score_adjust": 0.0, "adaptive_edge_adjust": 0.0, "adaptive_spread_adjust": 0.0, "last_order_id": None}
+        self.state = {
+            "position": None,
+            "cooldown_until": 0.0,
+            "day": utcnow().date().isoformat(),
+            "day_pnl_quote": 0.0,
+            "consecutive_losses": 0,
+            "last_entry_ts": 0.0,
+            "adaptive_score_adjust": 0.0,
+            "adaptive_edge_adjust": 0.0,
+            "adaptive_spread_adjust": 0.0,
+            "last_order_id": None,
+            "slippage_last_bps": 0.0,
+            "slippage_ema_bps": 0.0,
+            "expectancy_last_n": 0,
+            "winrate_last_n": 0.0,
+            "avg_win_last_n": 0.0,
+            "avg_loss_last_n": 0.0,
+            "health_last_success_ts": 0.0,
+            "health_last_ccxt_ok_ts": 0.0,
+            "health_consecutive_errors": 0,
+            "entry_block_reasons": [],
+            "regime_current": "UNKNOWN",
+            "regime_strength": 0.0,
+            "regime_stable_count": 0,
+            "replay_last_summary": None,
+            "last_exit_reason": None,
+            "last_exit_ts": 0.0,
+            "last_sl_ts": 0.0,
+            "last_sl_regime": None,
+            "last_sl_price": 0.0,
+            "last_sl_score": 0.0
+        }
         if os.path.exists(self.cfg.paths.state_path):
             try: self.state.update(json.load(open(self.cfg.paths.state_path, "r", encoding="utf-8")))
             except: pass
@@ -426,10 +510,10 @@ class V15Bot:
     def _reconcile_position(self):
         if self.cfg.dry_run: return
         try:
-            bal = self.ex.fetch_balance()
+            bal = self._ccxt_call(self.ex.fetch_balance)
             total_base = float(bal.get(self.base, {}).get("total", 0) or 0)
             min_qty = self._min_qty() or 1.0
-            ticker = self.ex.fetch_ticker(self.symbol)
+            ticker = self._ccxt_call(self.ex.fetch_ticker, self.symbol)
             price = float(ticker.get("last", 0) or 0)
             notional = total_base * price if price > 0 else 0
             state_pos = self.state.get("position")
@@ -437,14 +521,14 @@ class V15Bot:
                 if not state_pos:
                     self._log("WARN", f"Reconciliation: Found orphan position {total_base:.6f} {self.base}")
                     try:
-                        trades = self.ex.fetch_my_trades(self.symbol, limit=10)
+                        trades = self._ccxt_call(self.ex.fetch_my_trades, self.symbol, limit=10)
                         buy_trades = [t for t in trades if t.get("side") == "buy"]
                         if buy_trades:
                             entry_price = float(buy_trades[-1].get("price", price))
                             self.state["position"] = {"qty": total_base, "entry": entry_price, "entry_ts": time.time()-300,
                                 "sl": entry_price*(1-self.cfg.risk.sl_pct/100), "tp": entry_price*(1+self.cfg.risk.tp_pct/100),
-                                "trail_active": False, "trail_sl": entry_price*(1-self.cfg.risk.sl_pct/100), "regime": "RANGE",
-                                "regime_params": dataclasses.asdict(self.cfg.risk.range_params)}
+                                "trail_active": False, "trail_sl": entry_price*(1-self.cfg.risk.sl_pct/100), "trail_stage": "none",
+                                "regime": "RANGE", "regime_params": dataclasses.asdict(self.cfg.risk.range_params)}
                             self._save_state()
                     except Exception as e: self._log("ERROR", f"Reconciliation failed: {e}")
         except Exception as e: self._log("ERROR", f"Reconciliation error: {e}")
@@ -471,13 +555,16 @@ class V15Bot:
 
     def _fee_pct(self): return (self.cfg.money.fee_bps * 2) / 100.0
     def _slip_pct(self): return (self.cfg.money.slippage_bps * 2) / 100.0
-    def _safety_buffer_pct(self): return 0.04
-    def _total_cost_pct(self): return self._fee_pct() + self._slip_pct() + self._safety_buffer_pct()
+    def _slippage_ema_pct(self): return float(self.state.get("slippage_ema_bps", 0.0)) / 100.0
+    def _safety_buffer_pct(self): return 0.02
+    def _total_cost_pct(self):
+        slip = max(self._slip_pct(), self._slippage_ema_pct())
+        return self._fee_pct() + slip + self._safety_buffer_pct()
 
     def _spread_pct(self):
         if self.cfg.dry_run: return 0.02
         try:
-            ob = self.ex.fetch_order_book(self.symbol, limit=5)
+            ob = self._ccxt_call(self.ex.fetch_order_book, self.symbol, limit=5)
             bid, ask = (ob["bids"][0][0] if ob["bids"] else None), (ob["asks"][0][0] if ob["asks"] else None)
             if not bid or not ask: return 999.0
             return (ask - bid) / ((bid + ask) / 2) * 100.0
@@ -486,7 +573,7 @@ class V15Bot:
     def _free_quote(self):
         if self.cfg.dry_run: return self.cfg.money.quote_budget * 10
         try:
-            bal = self.ex.fetch_balance()
+            bal = self._ccxt_call(self.ex.fetch_balance)
             free = bal.get(self.quote, {}).get("free", None)
             if free is None: free = bal["free"].get(self.quote, 0.0)
             return float(free)
@@ -509,6 +596,15 @@ class V15Bot:
         if minq and qty < minq: qty = minq
         return max(qty, 0.0)
 
+    def _update_slippage(self, expected_price, filled_price, side):
+        if expected_price <= 0 or filled_price <= 0: return
+        direction = 1 if side == "buy" else -1
+        slippage_pct = ((filled_price - expected_price) / expected_price) * 100.0 * direction
+        slippage_bps = slippage_pct * 100.0
+        self.state["slippage_last_bps"] = slippage_bps
+        ema_prev = float(self.state.get("slippage_ema_bps", 0.0))
+        self.state["slippage_ema_bps"] = ema_prev * 0.9 + slippage_bps * 0.1
+
     def _fetch_ohlcv(self, limit=200):
         if self.cfg.dry_run:
             import random
@@ -521,7 +617,7 @@ class V15Bot:
             return o, h, l, c, v
         for attempt in range(3):
             try:
-                ohlcv = self.ex.fetch_ohlcv(self.symbol, timeframe=self.cfg.entry.timeframe, limit=limit)
+                ohlcv = self._ccxt_call(self.ex.fetch_ohlcv, self.symbol, timeframe=self.cfg.entry.timeframe, limit=limit)
                 return [float(x[1]) for x in ohlcv], [float(x[2]) for x in ohlcv], [float(x[3]) for x in ohlcv], [float(x[4]) for x in ohlcv], [float(x[5]) for x in ohlcv]
             except: self.risk_manager.record_error(); time.sleep(2**attempt)
         return [], [], [], [], []
@@ -546,13 +642,35 @@ class V15Bot:
         strength = ma_dist + slope_pct + atr_pct * 0.5
         return ("TREND", strength) if strength >= cfg.trend_min_strength else ("RANGE", strength)
 
+    def _regime_with_hysteresis(self, o, h, l, c, v):
+        regime, strength = self._regime(o, h, l, c, v)
+        current = self.state.get("regime_current", "UNKNOWN")
+        stable_count = int(self.state.get("regime_stable_count", 0))
+        current_strength = float(self.state.get("regime_strength", 0.0))
+        if current == "UNKNOWN":
+            self.state["regime_current"] = regime
+            self.state["regime_strength"] = strength
+            self.state["regime_stable_count"] = 1
+            return regime, strength
+        if regime == current:
+            self.state["regime_strength"] = strength
+            self.state["regime_stable_count"] = stable_count + 1
+            return regime, strength
+        if stable_count < self.cfg.regime_detection.hysteresis_bars and strength < current_strength + self.cfg.regime_detection.hysteresis_strength:
+            self.state["regime_stable_count"] = stable_count + 1
+            return current, current_strength
+        self.state["regime_current"] = regime
+        self.state["regime_strength"] = strength
+        self.state["regime_stable_count"] = 1
+        return regime, strength
+
     def _get_regime_params(self, regime):
         if regime == "TREND": return self.cfg.risk.trend_params
         elif regime == "RANGE": return self.cfg.risk.range_params
         elif regime == "CHOP": return self.cfg.risk.chop_params
         return RegimeParams(self.cfg.risk.tp_pct, self.cfg.risk.sl_pct, self.cfg.risk.trailing, self.cfg.risk.trail_activate_pct, self.cfg.risk.trail_step_pct, 0.0, 0.0)
 
-    def _score_entry(self, regime, o, h, l, c, ma7, ma25, ma99, atr_pct, vol_r, spread_pct):
+    def _score_entry(self, regime, o, h, l, c, ma7, ma25, ma99, atr_pct, vol_r, spread_pct, max_spread):
         reasons, score = [], 0.0
         regime_params = self._get_regime_params(regime)
         tp_pct = regime_params.tp_pct
@@ -560,7 +678,6 @@ class V15Bot:
         else: reasons.append("atr_low")
         if atr_pct <= self.cfg.entry.max_atr_pct: score += 1.0; reasons.append("atr_ok2")
         else: reasons.append("atr_high")
-        max_spread = self.cfg.entry.max_spread_pct + float(self.state.get("adaptive_spread_adjust", 0.0))
         if spread_pct <= max_spread: score += 1.4; reasons.append("spread_ok")
         else: reasons.append(f"spread_high({spread_pct:.3f}>{max_spread:.3f})")
         if vol_r >= self.cfg.entry.min_vol_ratio: score += 1.3; reasons.append("vol_ok")
@@ -575,18 +692,21 @@ class V15Bot:
         if overext: score += 0.8; reasons.append("overext_ok")
         else: reasons.append("overext_bad")
         ma99_dist_pct = abs(c - ma99) / c * 100.0
-        if ma99_dist_pct <= 0.15 and c > o: score += 1.5; reasons.append("ma99_bounce")
+        if ma99_dist_pct <= 0.20 and c > o: score += 0.3; reasons.append("ma99_bounce")
         trend_ok, trend_down = ma7 >= ma25 >= ma99, ma7 <= ma25 <= ma99
         if regime == "TREND":
-            if trend_ok: score += 1.8; reasons.append("trend_up")
-            elif trend_down: score -= 2.0; reasons.append("trend_down_block")
+            if trend_ok: score += 1.6; reasons.append("trend_up")
+            elif trend_down: score -= 0.8; reasons.append("trend_down_soft")
             else: score += 0.5; reasons.append("trend_mixed")
         elif regime == "RANGE":
-            if c >= ma99 * 0.998: score += 1.2; reasons.append("range_ok")
-            else: score += 0.2; reasons.append("below_ma99")
+            if c >= ma99 * 0.998: score += 0.3; reasons.append("range_ok")
+            else: score += 0.0; reasons.append("below_ma99")
         elif regime == "CHOP":
-            if abs(c - ma25) / c * 100.0 <= 0.25: score += 1.0; reasons.append("chop_near_ma")
+            ma_mid_dist = abs(c - ma25) / c * 100.0
+            if ma_mid_dist <= 0.22: score += 1.1; reasons.append("chop_near_ma")
             else: score += 0.3; reasons.append("chop_away_ma")
+            if wick_ok(o, h, l, c, self.cfg.entry.min_wick_ratio * 0.9) and spread_pct <= max_spread * 0.9:
+                score += 0.6; reasons.append("chop_wick_quality")
         total_cost = self._total_cost_pct() + spread_pct
         tp_edge = tp_pct - total_cost
         return score, reasons, tp_edge
@@ -616,38 +736,138 @@ class V15Bot:
         if winrate < cfg.threshold_pct: return cfg.tighten_score_add, cfg.tighten_edge_add, cfg.tighten_cooldown_add_s
         return 0.0, 0.0, 0
 
+    def _expectancy_stats(self):
+        trades = list(self.recent_trades)
+        n = len(trades)
+        if n < 6:
+            self.state["expectancy_last_n"] = n
+            self.state["winrate_last_n"] = 0.0
+            self.state["avg_win_last_n"] = 0.0
+            self.state["avg_loss_last_n"] = 0.0
+            return 0.0
+        wins = [p for p in trades if p > 0]
+        losses = [p for p in trades if p < 0]
+        winrate = (len(wins) / n) * 100.0 if n else 0.0
+        avg_win = sum(wins)/len(wins) if wins else 0.0
+        avg_loss = abs(sum(losses)/len(losses)) if losses else 0.0
+        expectancy = (len(wins)/n) * avg_win - (len(losses)/n) * avg_loss
+        self.state["expectancy_last_n"] = n
+        self.state["winrate_last_n"] = winrate
+        self.state["avg_win_last_n"] = avg_win
+        self.state["avg_loss_last_n"] = avg_loss
+        return expectancy
+
+    def _expectancy_adjustments(self):
+        expectancy = self._expectancy_stats()
+        score_add, edge_add, trail_tighten_mult, tp_mult, sl_mult = 0.0, 0.0, 1.0, 1.0, 1.0
+        if expectancy < 0:
+            score_add = 0.1
+            trail_tighten_mult = 0.9
+        return score_add, edge_add, trail_tighten_mult, tp_mult, sl_mult
+
+    def _throttle_modifiers(self, toxicity, day_pnl, consecutive_losses):
+        score_add, edge_add, cooldown_add_s = 0.0, 0.0, 0
+        max_spread_effective = self.cfg.entry.max_spread_pct + float(self.state.get("adaptive_spread_adjust", 0.0))
+        size_mult = 1.0
+        throttle_active = False
+        if toxicity.total >= 60:
+            throttle_active = True
+            score_add += 0.25
+            edge_add += 0.02
+            cooldown_add_s += 2
+            max_spread_effective = min(max_spread_effective, self.cfg.entry.max_spread_pct * 0.8)
+            size_mult = 0.9
+        if toxicity.total >= 90:
+            score_add += 0.35
+            edge_add += 0.03
+            cooldown_add_s += 4
+            max_spread_effective = min(max_spread_effective, self.cfg.entry.max_spread_pct * 0.65)
+            size_mult = 0.8
+        loss_limit = -abs(self.cfg.money.quote_budget) * (self.cfg.risk.daily_loss_limit_pct / 100.0)
+        if day_pnl <= loss_limit:
+            throttle_active = True
+            score_add += 0.15
+            edge_add += 0.015
+            cooldown_add_s += 5
+            size_mult = min(size_mult, 0.85)
+        throttle_losses = max(2, int(self.cfg.risk.throttle_consecutive_losses))
+        if consecutive_losses >= throttle_losses:
+            throttle_active = True
+            score_add += 0.15
+            edge_add += 0.015
+            cooldown_add_s += 3
+            size_mult = min(size_mult, 0.9)
+        score_add = min(score_add, 0.4)
+        edge_add = min(edge_add, 0.04)
+        return {
+            "active": throttle_active,
+            "score_add": score_add,
+            "edge_add": edge_add,
+            "cooldown_add_s": cooldown_add_s,
+            "max_spread_effective": max_spread_effective,
+            "size_mult": size_mult
+        }
+
     def _can_trade(self):
         now = time.time()
         if self._manual_pause: return False, "manual_pause"
-        if not self.risk_manager.entries_allowed(): return False, "risk_paused"
         wr_score_add, wr_edge_add, wr_cooldown_add = self._get_winrate_adjustment()
-        effective_cooldown = float(self.state.get("cooldown_until", 0.0)) + wr_cooldown_add
+        throttle_cooldown_add = int(self.state.get("throttle_cooldown_add_s", 0))
+        effective_cooldown = float(self.state.get("cooldown_until", 0.0)) + wr_cooldown_add + throttle_cooldown_add
         if now < effective_cooldown: return False, "cooldown"
         if now - float(self.state.get("last_entry_ts", 0.0)) < self.cfg.entry.entry_gap_s: return False, "entry_gap"
-        day_pnl = float(self.state.get("day_pnl_quote", 0.0))
-        limit = -abs(self.cfg.money.quote_budget) * (self.cfg.risk.daily_loss_limit_pct / 100.0)
-        if day_pnl <= limit: return False, "daily_loss_limit"
-        if int(self.state.get("consecutive_losses", 0)) >= self.cfg.risk.max_consecutive_losses: return False, "consecutive_losses_limit"
         if self.state.get("position") is not None: return False, "in_position"
         return True, "ok"
 
-    def _place_buy(self, qty):
-        if self.cfg.dry_run: return {"average": None, "filled": qty, "id": "dry_run"}
+    def _place_buy(self, qty, expected_price):
+        if self.cfg.dry_run: return {"average": expected_price, "filled": qty, "id": "dry_run"}
         last_order_id = self.state.get("last_order_id")
         if last_order_id:
             try:
-                existing = self.ex.fetch_order(last_order_id, self.symbol)
+                existing = self._ccxt_call(self.ex.fetch_order, last_order_id, self.symbol)
                 if existing.get("status") in ["open", "closed"] and existing.get("side") == "buy":
                     self._log("WARN", f"Skip duplicate buy - order {last_order_id} exists")
                     return existing
             except: pass
-        order = self.ex.create_market_buy_order(self.symbol, qty)
+        if self.cfg.entry.maker_first:
+            try:
+                ob = self._ccxt_call(self.ex.fetch_order_book, self.symbol, limit=5)
+                bid = ob["bids"][0][0] if ob["bids"] else expected_price
+                price = bid * (1.0 - self.cfg.entry.maker_first_offset_bps / 10000.0)
+                order = self._ccxt_call(self.ex.create_limit_buy_order, self.symbol, qty, price, {"postOnly": True})
+                order_id = order.get("id")
+                deadline = time.time() + self.cfg.entry.maker_first_timeout_s
+                while time.time() < deadline:
+                    time.sleep(0.3)
+                    check = self._ccxt_call(self.ex.fetch_order, order_id, self.symbol)
+                    if check.get("status") == "closed" or safe_float(check.get("remaining"), 1) <= 0:
+                        return check
+                self._ccxt_call(self.ex.cancel_order, order_id, self.symbol)
+            except Exception as e:
+                self._log("WARN", f"Maker-first failed: {e}")
+        order = self._ccxt_call(self.ex.create_market_buy_order, self.symbol, qty)
         self.state["last_order_id"] = order.get("id")
         return order
 
-    def _place_sell(self, qty):
-        if self.cfg.dry_run: return {"average": None, "filled": qty, "id": "dry_run"}
-        return self.ex.create_market_sell_order(self.symbol, qty)
+    def _place_sell(self, qty, expected_price):
+        if self.cfg.dry_run: return {"average": expected_price, "filled": qty, "id": "dry_run"}
+        if self.cfg.entry.maker_first:
+            try:
+                ob = self._ccxt_call(self.ex.fetch_order_book, self.symbol, limit=5)
+                ask = ob["asks"][0][0] if ob["asks"] else expected_price
+                price = ask * (1.0 + self.cfg.entry.maker_first_offset_bps / 10000.0)
+                order = self._ccxt_call(self.ex.create_limit_sell_order, self.symbol, qty, price, {"postOnly": True})
+                order_id = order.get("id")
+                deadline = time.time() + self.cfg.entry.maker_first_timeout_s
+                while time.time() < deadline:
+                    time.sleep(0.3)
+                    check = self._ccxt_call(self.ex.fetch_order, order_id, self.symbol)
+                    if check.get("status") == "closed" or safe_float(check.get("remaining"), 1) <= 0:
+                        return check
+                self._ccxt_call(self.ex.cancel_order, order_id, self.symbol)
+            except Exception as e:
+                self._log("WARN", f"Maker-first sell failed: {e}")
+        return self._ccxt_call(self.ex.create_market_sell_order, self.symbol, qty)
 
     def _notify_buy(self, price, qty, regime, score, atr_pct, spread_pct, sl_px, tp_px, dry_run=False):
         prefix = "🟡 [DRY] " if dry_run else "🟢 "
@@ -664,7 +884,7 @@ class V15Bot:
         wins = sum(1 for pnl in self.recent_trades if pnl >= 0)
         winrate = (wins / len(self.recent_trades) * 100) if self.recent_trades else 0
         toxicity = self.risk_manager.last_toxicity
-        paused = "⏸️ " if self.risk_manager.paused or self._manual_pause else ""
+        paused = "⏸️ " if self._manual_pause else ""
         self.tg.send(f"💓 {paused}<b>HEARTBEAT</b> {html_escape(self.cfg.name)}\n<code>Regime:</code> <b>{html_escape(regime)}</b> (str: {strength:.2f})\n<code>ATR:</code> {atr_pct:.3f}% | <code>Spread:</code> {spread_pct:.3f}%\n<code>Trades(2h):</code> {len(recent)} | <code>Last:</code> {last_trade}\n<code>Day PnL:</code> {pnl_badge(day_pnl)} <b>{day_pnl:+.4f} {html_escape(self.quote)}</b>\n<code>W/L:</code> {wins}/{len(self.recent_trades)-wins} ({winrate:.1f}%)\n<code>Toxicity:</code> {toxicity.total:.0f}/100\n🕐 {ts()}")
 
     def _notify_pause(self, reason): self.tg.send(f"⚠️ <b>PAUSED</b> - Toxic market\n<code>Reason:</code> {html_escape(reason)}\n🕐 {ts()}")
@@ -689,13 +909,48 @@ class V15Bot:
         if spread_pct > self.cfg.entry.max_spread_pct: constraints.append(f"spread({spread_pct:.3f}%>{self.cfg.entry.max_spread_pct}%)")
         if score < self.cfg.entry.min_score: constraints.append(f"score({score:.2f}<{self.cfg.entry.min_score})")
         if edge < self.cfg.entry.min_tp_edge_pct: constraints.append(f"edge({edge:.3f}%<{self.cfg.entry.min_tp_edge_pct}%)")
+        throttle_notes = self.state.get("entry_block_reasons", [])
+        if throttle_notes: constraints.append(f"throttle={','.join(throttle_notes)}")
         self._log("WARN", f"IDLE WATCHDOG: flat for {int(time_since_entry/60)}m | regime={regime} | blocking: {', '.join(constraints) or 'none'}")
 
     def _write_live_metrics(self, regime, strength, atr_pct, spread_pct, current_price):
         pos = self.state.get("position")
         unrealized_pnl = (current_price - float(pos["entry"])) * float(pos["qty"]) if pos else 0.0
         wins = sum(1 for p in self.recent_trades if p >= 0)
-        metrics = {"ts": time.time(), "price": current_price, "spread_pct": spread_pct, "atr_pct": atr_pct, "regime": regime, "regime_strength": strength, "toxicity_score": self.risk_manager.last_toxicity.total, "position": {"qty": float(pos["qty"]), "entry": float(pos["entry"]), "unrealized_pnl": unrealized_pnl} if pos else None, "pnl_day": float(self.state.get("day_pnl_quote", 0)), "wins": wins, "losses": len(self.recent_trades)-wins, "trades_today": len(self.recent_trades), "paused": self.risk_manager.paused or self._manual_pause, "uptime": time.time() - self._start_time}
+        metrics = {
+            "ts": time.time(),
+            "price": current_price,
+            "spread_pct": spread_pct,
+            "atr_pct": atr_pct,
+            "regime": regime,
+            "regime_current": self.state.get("regime_current", regime),
+            "regime_strength": strength,
+            "regime_stable_count": int(self.state.get("regime_stable_count", 0)),
+            "toxicity_score": self.risk_manager.last_toxicity.total,
+            "position": {"qty": float(pos["qty"]), "entry": float(pos["entry"]), "unrealized_pnl": unrealized_pnl} if pos else None,
+            "pnl_day": float(self.state.get("day_pnl_quote", 0)),
+            "wins": wins,
+            "losses": len(self.recent_trades)-wins,
+            "trades_today": len(self.recent_trades),
+            "paused": self._manual_pause,
+            "uptime": time.time() - self._start_time,
+            "throttle_active": bool(self.state.get("throttle_active", False)),
+            "throttle_score_add": float(self.state.get("throttle_score_add", 0.0)),
+            "throttle_edge_add": float(self.state.get("throttle_edge_add", 0.0)),
+            "throttle_cooldown_add_s": int(self.state.get("throttle_cooldown_add_s", 0)),
+            "throttle_max_spread_effective": float(self.state.get("throttle_max_spread_effective", 0.0)),
+            "expectancy_last_n": int(self.state.get("expectancy_last_n", 0)),
+            "winrate_last_n": float(self.state.get("winrate_last_n", 0.0)),
+            "avg_win_last_n": float(self.state.get("avg_win_last_n", 0.0)),
+            "avg_loss_last_n": float(self.state.get("avg_loss_last_n", 0.0)),
+            "slippage_last_bps": float(self.state.get("slippage_last_bps", 0.0)),
+            "slippage_ema_bps": float(self.state.get("slippage_ema_bps", 0.0)),
+            "health_last_success_ts": float(self.state.get("health_last_success_ts", 0.0)),
+            "health_last_ccxt_ok_ts": float(self.state.get("health_last_ccxt_ok_ts", 0.0)),
+            "health_consecutive_errors": int(self.state.get("health_consecutive_errors", 0)),
+            "entry_block_reasons": self.state.get("entry_block_reasons", []),
+            "replay_last_summary": self.state.get("replay_last_summary")
+        }
         metrics_path = os.path.join(os.path.dirname(self.cfg.paths.state_path), f"live_metrics_{self.instance_id}.json")
         try:
             with open(metrics_path + ".tmp", "w") as f: json.dump(metrics, f)
@@ -726,7 +981,7 @@ class V15Bot:
         o, h, l, c, v = self._fetch_ohlcv(limit=210)
         if not o: time.sleep(2.0); return
         if not self.cfg.dry_run:
-            raw = self.ex.fetch_ohlcv(self.symbol, timeframe=self.cfg.entry.timeframe, limit=2)
+            raw = self._ccxt_call(self.ex.fetch_ohlcv, self.symbol, timeframe=self.cfg.entry.timeframe, limit=2)
             candle_open_ms = int(raw[-1][0])
         else: candle_open_ms = int(time.time() * 1000) // (60 * 1000) * (60 * 1000)
         ma7, ma25, ma99, a = sma(c, 7), sma(c, 25), sma(c, 99), atr(h, l, c, 14)
@@ -735,40 +990,74 @@ class V15Bot:
         spread_pct = self._spread_pct()
         vol_r = self._vol_ratio(v, 20)
         current_price = c[-1]
-        regime, strength = self._regime(o, h, l, c, v)
+        candle_range_pct = (h[-1] - l[-1]) / current_price * 100.0 if current_price > 0 else 0.0
+        if candle_range_pct <= 0 or candle_range_pct > max(atr_pct * 6.0, 1.8):
+            self._log("WARN", f"Candle sanity skip range={candle_range_pct:.2f}% atr={atr_pct:.2f}%")
+            self.state["health_last_success_ts"] = time.time()
+            self._manage_position(current_price=current_price, atr_pct=atr_pct, spread_pct=spread_pct)
+            time.sleep(1.0)
+            return
+        regime, strength = self._regime_with_hysteresis(o, h, l, c, v)
         self.risk_manager.update_baseline_atr(atr_pct)
         self.risk_manager.record_ma_cross(current_price, ma7)
         toxicity = self.risk_manager.assess_toxicity(spread_pct, atr_pct, self._slip_pct())
-        should_pause, pause_reason = self.risk_manager.should_pause()
-        if should_pause: self.risk_manager.pause(); self._notify_pause(pause_reason)
-        should_resume, resume_reason = self.risk_manager.should_resume()
-        if should_resume: self.risk_manager.resume(); self._notify_resume(resume_reason)
+        throttle = self._throttle_modifiers(toxicity, float(self.state.get("day_pnl_quote", 0.0)), int(self.state.get("consecutive_losses", 0)))
+        self.state["throttle_active"] = throttle["active"]
+        self.state["throttle_score_add"] = throttle["score_add"]
+        self.state["throttle_edge_add"] = throttle["edge_add"]
+        self.state["throttle_cooldown_add_s"] = throttle["cooldown_add_s"]
+        self.state["throttle_max_spread_effective"] = throttle["max_spread_effective"]
         if time.time() - self.last_heartbeat >= self.cfg.telegram.heartbeat_minutes * 60:
             self._notify_heartbeat(regime, strength, atr_pct, spread_pct)
             self.last_heartbeat = time.time()
         self._write_live_metrics(regime, strength, atr_pct, spread_pct, current_price)
+        self.state["health_last_success_ts"] = time.time()
         if candle_open_ms == last_candle_ts:
-            self._manage_position(current_price=current_price)
+            self._manage_position(current_price=current_price, atr_pct=atr_pct, spread_pct=spread_pct, regime=regime, strength=strength)
             time.sleep(1.0); return
         self.state["_last_candle_ts"] = candle_open_ms
         self._save_state()
         self._update_adaptive_params()
+        exp_score_add, exp_edge_add, exp_trail_mult, exp_tp_mult, exp_sl_mult = self._expectancy_adjustments()
         regime_params = self._get_regime_params(regime)
         if regime == "CHOP" and self.cfg.regime_detection.block_entries_in_chop:
             self._log("INFO", f"CHOP blocked. price={fmt_price(current_price)}")
-            self._manage_position(current_price=current_price); return
-        score, reasons, base_tp_edge = self._score_entry(regime, o[-1], h[-1], l[-1], c[-1], ma7, ma25, ma99, atr_pct, vol_r, spread_pct)
+            self._manage_position(current_price=current_price, atr_pct=atr_pct, spread_pct=spread_pct, regime=regime, strength=strength); return
+        max_spread_effective = min(throttle["max_spread_effective"], self.cfg.frequency_control.max_spread_ceiling)
+        score, reasons, base_tp_edge = self._score_entry(regime, o[-1], h[-1], l[-1], c[-1], ma7, ma25, ma99, atr_pct, vol_r, spread_pct, max_spread_effective)
         adaptive_score = float(self.state.get("adaptive_score_adjust", 0.0))
         adaptive_edge = float(self.state.get("adaptive_edge_adjust", 0.0))
         wr_score_add, wr_edge_add, _ = self._get_winrate_adjustment()
-        adjusted_score = score + regime_params.min_score_adjust + adaptive_score + wr_score_add
-        adjusted_edge_threshold = self.cfg.entry.min_tp_edge_pct + regime_params.min_tp_edge_adjust + adaptive_edge + wr_edge_add
+        adjusted_score = score + regime_params.min_score_adjust + adaptive_score + wr_score_add + throttle["score_add"] + exp_score_add
+        adjusted_edge_threshold = self.cfg.entry.min_tp_edge_pct + regime_params.min_tp_edge_adjust + adaptive_edge + wr_edge_add + throttle["edge_add"] + exp_edge_add
+        total_cost = self._total_cost_pct() + spread_pct
         viable = adjusted_score >= self.cfg.entry.min_score and base_tp_edge >= adjusted_edge_threshold
+        entry_block_reasons = []
+        if spread_pct > max_spread_effective: entry_block_reasons.append("spread")
+        if adjusted_score < self.cfg.entry.min_score: entry_block_reasons.append("score")
+        if base_tp_edge < adjusted_edge_threshold: entry_block_reasons.append("edge")
+        if throttle["active"]: entry_block_reasons.append("throttle")
+        last_sl_ts = float(self.state.get("last_sl_ts", 0.0))
+        if last_sl_ts and time.time() - last_sl_ts < self.cfg.risk.cooldown_after_close_s * 3:
+            last_sl_price = float(self.state.get("last_sl_price", 0.0))
+            last_sl_score = float(self.state.get("last_sl_score", 0.0))
+            last_sl_regime = self.state.get("last_sl_regime")
+            price_ok = last_sl_price <= 0 or abs(current_price - last_sl_price) / last_sl_price > 0.0015
+            score_ok = adjusted_score > last_sl_score + 0.2
+            if last_sl_regime == regime and not (price_ok or score_ok):
+                viable = False
+                entry_block_reasons.append("reentry_guard")
+        self.state["entry_block_reasons"] = entry_block_reasons
+        self._save_state()
         self._log("INFO", f"price={fmt_price(current_price)} regime={regime}({strength:.2f}) score={score:.2f}→{adjusted_score:.2f} atr={atr_pct:.3f}% vR={vol_r:.2f} spread={spread_pct:.3f}% edge={base_tp_edge:.3f}≥{adjusted_edge_threshold:.3f} viable={viable} tox={toxicity.total:.0f}")
-        self._manage_position(current_price=current_price)
+        self._manage_position(current_price=current_price, atr_pct=atr_pct, spread_pct=spread_pct, regime=regime, strength=strength)
         self._idle_watchdog(regime, atr_pct, spread_pct, adjusted_score, base_tp_edge)
         can, why = self._can_trade()
         if not can:
+            if why not in entry_block_reasons:
+                entry_block_reasons.append(why)
+                self.state["entry_block_reasons"] = entry_block_reasons
+                self._save_state()
             if viable: self._paper_journal({"ts": ts(), "symbol": self.symbol, "regime": regime, "score": f"{adjusted_score:.2f}", "price": f"{current_price:.8f}", "blocked_reason": why, "reasons": ",".join(reasons)})
             return
         free_q = self._free_quote()
@@ -776,68 +1065,147 @@ class V15Bot:
         if not viable:
             self._paper_journal({"ts": ts(), "symbol": self.symbol, "regime": regime, "score": f"{adjusted_score:.2f}", "price": f"{current_price:.8f}", "blocked_reason": "score_or_edge", "reasons": ",".join(reasons)})
             return
-        qty = self._calc_qty(price=current_price)
+        qty = self._calc_qty(price=current_price) * throttle["size_mult"]
         if qty <= 0: self._log("WARN", "qty <= 0"); return
         entry_price = current_price
-        sl_px = entry_price * (1.0 - regime_params.sl_pct / 100.0)
-        tp_px = entry_price * (1.0 + regime_params.tp_pct / 100.0)
+        min_tp_pct = max(regime_params.tp_pct * exp_tp_mult, total_cost)
+        min_sl_pct = max(regime_params.sl_pct * exp_sl_mult, atr_pct * 0.35)
+        sl_px = entry_price * (1.0 - min_sl_pct / 100.0)
+        tp_px = entry_price * (1.0 + min_tp_pct / 100.0)
         try:
-            order = self._place_buy(qty)
+            order = self._place_buy(qty, entry_price)
             filled_qty = safe_float(order.get("filled"), safe_float(order.get("amount"), qty))
             if not self.cfg.dry_run:
                 try: filled_qty = float(self.ex.amount_to_precision(self.symbol, filled_qty))
                 except: pass
             filled = safe_float(order.get("average"), entry_price) or entry_price
-            self.state["position"] = {"qty": filled_qty, "entry": filled, "entry_ts": time.time(), "sl": sl_px, "tp": tp_px, "trail_active": False, "trail_sl": sl_px, "regime": regime, "regime_params": {"tp_pct": regime_params.tp_pct, "sl_pct": regime_params.sl_pct, "trailing": regime_params.trailing, "trail_activate_pct": regime_params.trail_activate_pct, "trail_step_pct": regime_params.trail_step_pct}}
+            self._update_slippage(entry_price, filled, "buy")
+            self.state["position"] = {
+                "qty": filled_qty,
+                "entry": filled,
+                "entry_ts": time.time(),
+                "sl": sl_px,
+                "tp": tp_px,
+                "trail_active": False,
+                "trail_sl": sl_px,
+                "trail_stage": "none",
+                "regime": regime,
+                "regime_params": {
+                    "tp_pct": min_tp_pct,
+                    "sl_pct": min_sl_pct,
+                    "trailing": regime_params.trailing,
+                    "trail_activate_pct": regime_params.trail_activate_pct,
+                    "trail_step_pct": regime_params.trail_step_pct
+                },
+                "entry_score": score,
+                "adjusted_score": adjusted_score,
+                "edge": base_tp_edge,
+                "adjusted_edge_threshold": adjusted_edge_threshold,
+                "atr_pct": atr_pct,
+                "spread_pct": spread_pct,
+                "regime_strength": strength,
+                "exp_trail_tighten_mult": exp_trail_mult,
+                "exp_tp_mult": exp_tp_mult,
+                "exp_sl_mult": exp_sl_mult
+            }
             self.state["last_entry_ts"] = time.time()
+            self.state["last_entry_score"] = adjusted_score
             self._save_state()
             self._log("INFO", f"{'[DRY] ' if self.cfg.dry_run else ''}BUY filled qty={qty:.6f} entry={fmt_price(filled)} sl={fmt_price(sl_px)} tp={fmt_price(tp_px)} regime={regime}")
             self._notify_buy(price=filled, qty=qty, regime=regime, score=adjusted_score, atr_pct=atr_pct, spread_pct=spread_pct, sl_px=sl_px, tp_px=tp_px, dry_run=self.cfg.dry_run)
         except Exception as e: self._log("ERROR", f"BUY failed: {repr(e)}"); self.risk_manager.record_error()
+        self.state["health_last_success_ts"] = time.time()
 
-    def _manage_position(self, current_price):
+    def _manage_position(self, current_price, atr_pct=None, spread_pct=None, regime=None, strength=None):
         pos = self.state.get("position")
         if not pos: return
         entry, qty, sl, tp = float(pos["entry"]), float(pos["qty"]), float(pos["sl"]), float(pos["tp"])
         trail_active, trail_sl = bool(pos.get("trail_active", False)), float(pos.get("trail_sl", sl))
+        trail_stage = pos.get("trail_stage", "none")
         regime_params_dict = pos.get("regime_params", {})
         trailing_enabled = regime_params_dict.get("trailing", True)
         trail_activate_pct = regime_params_dict.get("trail_activate_pct", self.cfg.risk.trail_activate_pct)
         trail_step_pct = regime_params_dict.get("trail_step_pct", self.cfg.risk.trail_step_pct)
+        tp_pct = float(regime_params_dict.get("tp_pct", self.cfg.risk.tp_pct))
+        sl_pct = float(regime_params_dict.get("sl_pct", self.cfg.risk.sl_pct))
+        exp_trail_mult = float(pos.get("exp_trail_tighten_mult", 1.0))
+        exp_tp_mult = float(pos.get("exp_tp_mult", 1.0))
+        exp_sl_mult = float(pos.get("exp_sl_mult", 1.0))
+        tp_adj = entry * (1.0 + (tp_pct * exp_tp_mult) / 100.0)
+        sl_adj = entry * (1.0 - (sl_pct * exp_sl_mult) / 100.0)
+        tp = tp_adj
+        sl = sl_adj
+        pos["tp"], pos["sl"] = tp, sl
+        up_pct = pct(entry, current_price)
+        early_step = trail_step_pct * 1.25 * exp_trail_mult
+        late_step = trail_step_pct * 0.7 * exp_trail_mult
+        late_trigger = max(trail_activate_pct * 2.0, tp_pct * 0.6)
         if trailing_enabled:
-            up_pct = pct(entry, current_price)
             if not trail_active and up_pct >= trail_activate_pct:
                 trail_active = True
-                trail_sl = max(trail_sl, entry * (1.0 + (trail_activate_pct - trail_step_pct) / 100.0))
+                trail_stage = "early"
+                trail_sl = max(trail_sl, entry * (1.0 + (trail_activate_pct - early_step) / 100.0))
             if trail_active:
-                desired = current_price * (1.0 - trail_step_pct / 100.0)
+                if up_pct >= late_trigger:
+                    trail_stage = "late"
+                step = late_step if trail_stage == "late" else early_step
+                desired = current_price * (1.0 - step / 100.0)
                 if desired > trail_sl: trail_sl = desired
         held_min = (time.time() - float(pos["entry_ts"])) / 60.0
         time_stop = held_min >= self.cfg.risk.max_hold_minutes
+        time_soft_stop = held_min >= self.cfg.risk.max_hold_minutes * 0.6
         hit_sl = current_price <= (trail_sl if trail_active else sl)
         hit_tp = current_price >= tp
-        if hit_tp or hit_sl or time_stop:
-            reason = "TP" if hit_tp else ("SL" if hit_sl else "TIME")
+        spread_spike = spread_pct is not None and spread_pct > self.cfg.entry.max_spread_pct * 1.6
+        noise_buffer = min(max((atr_pct or 0) * 0.35, 0.02), 0.15)
+        total_cost = self._total_cost_pct() + (spread_pct or 0.0)
+        net_threshold = total_cost + noise_buffer
+        in_profit = up_pct >= net_threshold
+        if spread_spike and up_pct <= net_threshold:
+            self._close_position("SPREAD", current_price, pos)
+            return
+        if spread_spike and up_pct > 0 and trail_active:
+            tightened = current_price * (1.0 - (late_step * 0.8) / 100.0)
+            trail_sl = max(trail_sl, tightened)
+            trail_stage = "late"
+        if time_stop and (trail_active or in_profit):
+            time_stop = False
+        if time_soft_stop and not in_profit and up_pct < total_cost * 0.5:
+            time_stop = True
+        if hit_sl:
+            self._close_position("SL", current_price, pos)
+            return
+        if hit_tp:
+            if up_pct < net_threshold and not spread_spike:
+                pos["trail_active"], pos["trail_sl"], pos["trail_stage"] = trail_active, trail_sl, trail_stage
+                self.state["position"] = pos
+                self._save_state()
+                return
+            self._close_position("TP", current_price, pos)
+            return
+        if time_stop and (not trail_active) and (not in_profit):
+            reason = "TIME_COST" if up_pct < net_threshold else "TIME"
             self._close_position(reason, current_price, pos)
-        else:
-            pos["trail_active"], pos["trail_sl"] = trail_active, trail_sl
-            self.state["position"] = pos
-            self._save_state()
+            return
+        pos["trail_active"], pos["trail_sl"], pos["trail_stage"] = trail_active, trail_sl, trail_stage
+        self.state["position"] = pos
+        self._save_state()
 
     def _close_position(self, reason, current_price, pos):
         entry, qty = float(pos["entry"]), float(pos["qty"])
         try:
             sell_qty = qty
             if not self.cfg.dry_run:
-                bal = self.ex.fetch_balance()
+                bal = self._ccxt_call(self.ex.fetch_balance)
                 free_base = float(bal.get(self.base, {}).get("free", 0) or 0)
                 sell_qty = min(qty, free_base * 0.995)
                 try: sell_qty = float(self.ex.amount_to_precision(self.symbol, sell_qty))
                 except: pass
                 minq = self._min_qty()
                 if minq and sell_qty < minq: self._log("WARN", f"SELL skipped: qty {sell_qty:.8f} < min {minq:.8f}"); return
-            order = self._place_sell(sell_qty)
+            order = self._place_sell(sell_qty, current_price)
             exit_p = safe_float(order.get("average"), current_price) or current_price
+            self._update_slippage(current_price, exit_p, "sell")
         except Exception as e: self._log("ERROR", f"SELL failed: {repr(e)}"); self.risk_manager.record_error(); return
         gross = (exit_p - entry) * sell_qty
         fees = (entry * sell_qty + exit_p * sell_qty) * (self.cfg.money.fee_bps / 10000.0)
@@ -852,8 +1220,39 @@ class V15Bot:
         self.state["position"] = None
         self.state["cooldown_until"] = time.time() + self.cfg.risk.cooldown_after_close_s
         self.state["last_order_id"] = None
+        self.state["last_exit_reason"] = reason
+        self.state["last_exit_ts"] = time.time()
+        if reason == "SL":
+            self.state["last_sl_ts"] = time.time()
+            self.state["last_sl_regime"] = pos.get("regime")
+            self.state["last_sl_price"] = exit_p
+            self.state["last_sl_score"] = float(pos.get("adjusted_score", 0.0))
         self._save_state()
-        self._journal({"ts": ts(), "symbol": self.symbol, "regime": pos.get("regime", "UNKNOWN"), "reason": reason, "qty": f"{sell_qty:.8f}", "entry": f"{entry:.8f}", "exit": f"{exit_p:.8f}", "gross_quote": f"{gross:.8f}", "fees_quote_est": f"{fees:.8f}", "pnl_quote": f"{pnl_q:.8f}", "pnl_pct": f"{pnl_pct:.4f}", "day_pnl_quote": f"{float(self.state.get('day_pnl_quote', 0.0)):.8f}"})
+        held_minutes = (time.time() - float(pos.get("entry_ts", time.time()))) / 60.0
+        self._journal({
+            "ts": ts(),
+            "symbol": self.symbol,
+            "regime": pos.get("regime", "UNKNOWN"),
+            "reason": reason,
+            "qty": f"{sell_qty:.8f}",
+            "entry": f"{entry:.8f}",
+            "exit": f"{exit_p:.8f}",
+            "gross_quote": f"{gross:.8f}",
+            "fees_quote_est": f"{fees:.8f}",
+            "pnl_quote": f"{pnl_q:.8f}",
+            "pnl_pct": f"{pnl_pct:.4f}",
+            "day_pnl_quote": f"{float(self.state.get('day_pnl_quote', 0.0)):.8f}",
+            "score": f"{float(pos.get('entry_score', 0.0)):.3f}",
+            "adjusted_score": f"{float(pos.get('adjusted_score', 0.0)):.3f}",
+            "edge": f"{float(pos.get('edge', 0.0)):.3f}",
+            "adjusted_edge_threshold": f"{float(pos.get('adjusted_edge_threshold', 0.0)):.3f}",
+            "atr_pct": f"{float(pos.get('atr_pct', 0.0)):.3f}",
+            "spread_pct": f"{float(pos.get('spread_pct', 0.0)):.3f}",
+            "slippage_last_bps": f"{float(self.state.get('slippage_last_bps', 0.0)):.2f}",
+            "slippage_ema_bps": f"{float(self.state.get('slippage_ema_bps', 0.0)):.2f}",
+            "held_minutes": f"{held_minutes:.2f}",
+            "regime_strength": f"{float(pos.get('regime_strength', 0.0)):.3f}"
+        })
         self._notify_sell(reason=reason, entry=entry, exit_=exit_p, qty=sell_qty, pnl_q=pnl_q, pnl_pct=pnl_pct, fees=fees, dry_run=self.cfg.dry_run)
 
     def _force_close_position(self, reason):
@@ -861,14 +1260,148 @@ class V15Bot:
         if not pos: return
         if self.cfg.dry_run: current_price = 2.1
         else:
-            ticker = self.ex.fetch_ticker(self.symbol)
+            ticker = self._ccxt_call(self.ex.fetch_ticker, self.symbol)
             current_price = float(ticker.get("last", 0))
         self._close_position(reason, current_price, pos)
+
+def _load_replay_csv(path):
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            try:
+                rows.append([float(r.get("timestamp", 0) or 0), float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]), float(r.get("volume", 0) or 0)])
+            except Exception:
+                continue
+    return rows
+
+def run_replay(cfg: BotCfg, args):
+    cfg = dataclasses.replace(cfg, dry_run=True)
+    bot = V15Bot(cfg, instance_id="replay")
+    rng = random.Random(42)
+    if args.replay_csv:
+        data = _load_replay_csv(args.replay_csv)
+    else:
+        ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        now = int(time.time() * 1000)
+        days_ms = int(args.replay_days) * 24 * 60 * 60 * 1000
+        since = now - days_ms
+        data = ex.fetch_ohlcv(cfg.money.symbol, timeframe=cfg.entry.timeframe, since=since, limit=2000)
+    if not data:
+        print("Replay: no data")
+        return
+    tf_min = int(cfg.entry.timeframe.replace("m", "")) if "m" in cfg.entry.timeframe else 1
+    pos = None
+    trades = []
+    breakdown_reason = {}
+    breakdown_regime = {}
+    for i in range(100, len(data)):
+        window = data[:i+1]
+        o = [x[1] for x in window]
+        h = [x[2] for x in window]
+        l = [x[3] for x in window]
+        c = [x[4] for x in window]
+        v = [x[5] for x in window]
+        ma7, ma25, ma99, a = sma(c, 7), sma(c, 25), sma(c, 99), atr(h, l, c, 14)
+        if ma7 is None or ma25 is None or ma99 is None or a is None:
+            continue
+        atr_pct = a / c[-1] * 100.0
+        spread_pct = min(cfg.entry.max_spread_pct, max(0.01, atr_pct * 0.25))
+        regime, strength = bot._regime_with_hysteresis(o, h, l, c, v)
+        regime_params = bot._get_regime_params(regime)
+        exp_score_add, exp_edge_add, exp_trail_mult, exp_tp_mult, exp_sl_mult = bot._expectancy_adjustments()
+        max_spread_effective = min(cfg.entry.max_spread_pct, cfg.frequency_control.max_spread_ceiling)
+        score, reasons, base_tp_edge = bot._score_entry(regime, o[-1], h[-1], l[-1], c[-1], ma7, ma25, ma99, atr_pct, bot._vol_ratio(v, 20), spread_pct, max_spread_effective)
+        adjusted_score = score + regime_params.min_score_adjust + exp_score_add
+        adjusted_edge_threshold = cfg.entry.min_tp_edge_pct + regime_params.min_tp_edge_adjust + exp_edge_add
+        total_cost = bot._total_cost_pct() + spread_pct + max(atr_pct * 0.25, 0.02)
+        viable = adjusted_score >= cfg.entry.min_score and base_tp_edge >= adjusted_edge_threshold and regime_params.tp_pct * exp_tp_mult >= total_cost
+        current_price = c[-1]
+        if pos:
+            entry = pos["entry"]
+            held_min = (i - pos["entry_i"]) * tf_min
+            up_pct = pct(entry, current_price)
+            trail_step = regime_params.trail_step_pct * exp_trail_mult
+            early_step = trail_step * 1.25
+            late_step = trail_step * 0.7
+            if not pos["trail_active"] and up_pct >= regime_params.trail_activate_pct:
+                pos["trail_active"] = True
+                pos["trail_stage"] = "early"
+                pos["trail_sl"] = max(pos["trail_sl"], entry * (1.0 + (regime_params.trail_activate_pct - early_step) / 100.0))
+            if pos["trail_active"]:
+                if up_pct >= max(regime_params.trail_activate_pct * 2.0, regime_params.tp_pct * 0.6):
+                    pos["trail_stage"] = "late"
+                step = late_step if pos["trail_stage"] == "late" else early_step
+                pos["trail_sl"] = max(pos["trail_sl"], current_price * (1.0 - step / 100.0))
+            hit_sl = current_price <= (pos["trail_sl"] if pos["trail_active"] else pos["sl"])
+            hit_tp = current_price >= pos["tp"]
+            time_stop = held_min >= cfg.risk.max_hold_minutes
+            noise_buffer = max(atr_pct * 0.35, 0.02)
+            net_threshold = bot._total_cost_pct() + spread_pct + noise_buffer
+            in_profit = up_pct >= net_threshold
+            if time_stop and in_profit and pos["trail_active"] and held_min < cfg.risk.max_hold_minutes * 1.5:
+                time_stop = False
+            if hit_sl or hit_tp or time_stop:
+                reason = "SL" if hit_sl else ("TP" if hit_tp else "TIME")
+                slip_pct = (cfg.money.slippage_bps / 100.0) + rng.uniform(0.0, atr_pct * 0.05)
+                noise_pct = rng.uniform(0.0, atr_pct * 0.05)
+                exit_price = current_price * (1.0 - (spread_pct + slip_pct + noise_pct) / 100.0)
+                gross = (exit_price - entry) * pos["qty"]
+                fees = (entry * pos["qty"] + exit_price * pos["qty"]) * (cfg.money.fee_bps / 10000.0)
+                pnl = gross - fees
+                trades.append({"pnl": pnl, "reason": reason, "regime": pos["regime"]})
+                bot.recent_trades.append(pnl)
+                breakdown_reason[reason] = breakdown_reason.get(reason, 0) + 1
+                breakdown_regime[pos["regime"]] = breakdown_regime.get(pos["regime"], 0) + 1
+                pos = None
+        if not pos and viable:
+            slip_pct = (cfg.money.slippage_bps / 100.0) + rng.uniform(0.0, atr_pct * 0.05)
+            noise_pct = rng.uniform(0.0, atr_pct * 0.05)
+            entry_price = current_price * (1.0 + (spread_pct + slip_pct + noise_pct) / 100.0)
+            qty = cfg.money.quote_budget / entry_price
+            pos = {
+                "entry": entry_price,
+                "qty": qty,
+                "sl": entry_price * (1.0 - (regime_params.sl_pct * exp_sl_mult) / 100.0),
+                "tp": entry_price * (1.0 + (regime_params.tp_pct * exp_tp_mult) / 100.0),
+                "trail_active": False,
+                "trail_sl": entry_price * (1.0 - (regime_params.sl_pct * exp_sl_mult) / 100.0),
+                "trail_stage": "none",
+                "entry_i": i,
+                "regime": regime
+            }
+    wins = [t["pnl"] for t in trades if t["pnl"] > 0]
+    losses = [t["pnl"] for t in trades if t["pnl"] < 0]
+    winrate = (len(wins)/len(trades)*100.0) if trades else 0.0
+    avg_win = sum(wins)/len(wins) if wins else 0.0
+    avg_loss = abs(sum(losses)/len(losses)) if losses else 0.0
+    expectancy = (len(wins)/len(trades)) * avg_win - (len(losses)/len(trades)) * avg_loss if trades else 0.0
+    summary = {
+        "trades": len(trades),
+        "winrate_pct": winrate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "breakdown_reason": breakdown_reason,
+        "breakdown_regime": breakdown_regime
+    }
+    bot.state["replay_last_summary"] = summary
+    bot._save_state()
+    print(json.dumps(summary, indent=2))
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to config json")
+    ap.add_argument("--replay", action="store_true", help="Run replay mode")
+    ap.add_argument("--replay-days", type=int, default=5, help="Replay lookback days")
+    ap.add_argument("--replay-csv", default="", help="Replay CSV path")
+    ap.add_argument("--replay-from", default="", help="Replay start (optional)")
+    ap.add_argument("--replay-to", default="", help="Replay end (optional)")
     args = ap.parse_args()
+    if args.replay:
+        cfg = load_cfg(args.config)
+        run_replay(cfg, args)
+        return
     instance_id = get_instance_id(args.config)
     lock = InstanceLock(instance_id)
     if not lock.acquire():

@@ -1,0 +1,103 @@
+{
+  "name": "V144_XRP_SCALPER",
+  "exchange": "binance",
+  "api_key": "",
+  "api_secret": "",
+  "testnet": false,
+  "dry_run": false,
+  "money": {
+    "symbol": "XRP/USDC",
+    "quote_budget": 34,
+    "max_positions": 1,
+    "fee_bps": 7.5,
+    "slippage_bps": 1.5
+  },
+  "entry": {
+    "timeframe": "1m",
+    "min_atr_pct": 0.02,
+    "max_atr_pct": 0.8,
+    "max_spread_pct": 0.1,
+    "min_vol_ratio": 0.6,
+    "min_wick_ratio": 0.1,
+    "min_score": 1.5,
+    "min_tp_edge_pct": 0.06,
+    "entry_gap_s": 8
+  },
+  "risk": {
+    "sl_pct": 0.22,
+    "tp_pct": 0.42,
+    "trailing": true,
+    "trail_activate_pct": 0.22,
+    "trail_step_pct": 0.08,
+    "max_hold_minutes": 18,
+    "cooldown_after_close_s": 8,
+    "daily_loss_limit_pct": 4.0,
+    "max_consecutive_losses": 99999,
+    "trend_params": {
+      "tp_pct": 0.48,
+      "sl_pct": 0.26,
+      "trailing": true,
+      "trail_activate_pct": 0.22,
+      "trail_step_pct": 0.08,
+      "min_score_adjust": -0.3,
+      "min_tp_edge_adjust": -0.02
+    },
+    "range_params": {
+      "tp_pct": 0.5,
+      "sl_pct": 0.26,
+      "trailing": true,
+      "trail_activate_pct": 0.18,
+      "trail_step_pct": 0.08,
+      "min_score_adjust": 0.0,
+      "min_tp_edge_adjust": 0.04
+    },
+    "chop_params": {
+      "tp_pct": 0.52,
+      "sl_pct": 0.26,
+      "trailing": true,
+      "trail_activate_pct": 0.26,
+      "trail_step_pct": 0.1,
+      "min_score_adjust": 0.2,
+      "min_tp_edge_adjust": 0.08
+    }
+  },
+  "regime_detection": {
+    "chop_max_atr_pct": 0.06,
+    "chop_max_ma_dist_pct": 0.1,
+    "chop_max_slope_pct": 0.06,
+    "chop_max_vol_ratio": 1.0,
+    "trend_min_strength": 0.2,
+    "block_entries_in_chop": false
+  },
+  "frequency_control": {
+    "enabled": true,
+    "target_trades_per_2h": 12,
+    "window_minutes": 120,
+    "adjust_step_score": 0.06,
+    "adjust_step_edge": 0.015,
+    "adjust_step_spread": 0.003,
+    "min_score_floor": 1.5,
+    "min_edge_floor": 0.02,
+    "max_spread_ceiling": 0.12
+  },
+  "winrate_protection": {
+    "enabled": true,
+    "rolling_window_trades": 20,
+    "threshold_pct": 45.0,
+    "tighten_score_add": 0.15,
+    "tighten_edge_add": 0.06,
+    "tighten_cooldown_add_s": 2
+  },
+  "paths": {
+    "log_path": "logs/bot_xrp_scalper_1m.log",
+    "state_path": "logs/state_xrp_scalper_1m.json",
+    "journal_path": "logs/trade_journal_xrp_scalper_1m.csv",
+    "paper_journal_path": "logs/paper_signals_xrp_scalper_1m.csv"
+  },
+  "telegram": {
+    "enabled": true,
+    "token": "",
+    "chat_id": "",
+    "heartbeat_minutes": 15
+  }
+}
